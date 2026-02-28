@@ -8,8 +8,3 @@ python-multipart==0.0.9
 bcrypt==3.2.2
 pydantic[email]==2.9.2
 httpx>=0.27.0
-=======
-fastapi
-uvicorn
-pydantic
->>>>>>> 70de87d9c82f50ccf8e2da2234c721fcdee3c164
