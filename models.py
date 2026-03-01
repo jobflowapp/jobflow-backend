@@ -26,6 +26,10 @@ class User(Base):
     full_name = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
+    # RevenueCat subscription fields
+    revenuecat_id = Column(String, nullable=True, index=True)
+    subscription_tier = Column(String, nullable=False, default="free", server_default="free")
+
     jobs = relationship("Job", back_populates="user", cascade="all, delete-orphan", passive_deletes=True)
 
 

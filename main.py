@@ -4,9 +4,10 @@ import os
 from datetime import datetime, timedelta
 from typing import Optional, List
 
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.staticfiles import StaticFiles
 from jose import jwt, JWTError
 from passlib.context import CryptContext
 from pydantic import BaseModel, EmailStr, ConfigDict
@@ -30,6 +31,9 @@ def _parse_cors_origins(raw: str) -> list[str]:
 
 app = FastAPI(title="JobFlow API")
 
+# Serve static assets (icon, images, etc.)
+app.mount("/assets", StaticFiles(directory="assets"), name="assets")
+
 cors_origins = _parse_cors_origins(_env("CORS_ORIGINS", "*"))
 app.add_middleware(
     CORSMiddleware,
@@ -41,9 +45,32 @@ app.add_middleware(
 
 Base.metadata.create_all(bind=engine)
 
+
+def _migrate_db():
+    """Idempotent migration — adds new columns to existing tables without Alembic."""
+    from sqlalchemy import text
+    with engine.connect() as conn:
+        for sql in [
+            "ALTER TABLE users ADD COLUMN revenuecat_id VARCHAR",
+            "ALTER TABLE users ADD COLUMN subscription_tier VARCHAR NOT NULL DEFAULT 'free'",
+        ]:
+            try:
+                conn.execute(text(sql))
+                conn.commit()
+            except Exception:
+                pass  # Column already exists — safe to ignore
+
+
+_migrate_db()
+
 SECRET_KEY = _env("SECRET_KEY", "CHANGE_ME_TO_A_LONG_RANDOM_SECRET")
 ALGORITHM = _env("JWT_ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_DAYS = int(_env("ACCESS_TOKEN_EXPIRE_DAYS", "30"))
+
+# RevenueCat
+REVENUECAT_API_KEY = _env("REVENUECAT_API_KEY", "")
+REVENUECAT_PRO_ENTITLEMENT = _env("REVENUECAT_PRO_ENTITLEMENT", "pro")
+REVENUECAT_WEBHOOK_SECRET = _env("REVENUECAT_WEBHOOK_SECRET", "")
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
@@ -85,6 +112,16 @@ def get_current_user(
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
     return user
+
+
+def require_pro(me: User = Depends(get_current_user)) -> User:
+    """Dependency that blocks non-Pro users from accessing Pro-only endpoints."""
+    if me.subscription_tier != "pro":
+        raise HTTPException(
+            status_code=403,
+            detail="Pro subscription required. Upgrade in the app to unlock AI features.",
+        )
+    return me
 
 
 class _ORMModel(BaseModel):
@@ -384,6 +421,7 @@ def update_expense(expense_id: int, data: ExpenseUpdateIn, db: Session = Depends
 
 
 
+@app.delete("/mileage/{mileage_id}")
 def delete_mileage(mileage_id: int, db: Session = Depends(get_db), me: User = Depends(get_current_user)):
     item = db.query(Mileage).filter(Mileage.id == mileage_id, Mileage.user_id == me.id).first()
     if not item:
@@ -547,7 +585,7 @@ Rules:
 - Be direct and conversational. No fluff, no corporate jargon.
 - Use dollar amounts and percentages from the data. Be specific.
 - Give concrete action steps, not vague suggestions.
-- Flag problems clearly: underpricng, cash flow risks, missed deductions.
+- Flag problems clearly: underpricing, cash flow risks, missed deductions.
 - Be encouraging but honest. If a number is bad, say so and explain why.
 - Keep responses focused and scannable. Use short paragraphs.
 - Always respond in valid JSON matching the schema requested.
@@ -585,7 +623,7 @@ class AIForecastOut(BaseModel):
 
 # ─── /ai/analyze ───────────────────────────────────────────────────────────────
 @app.get("/ai/analyze", response_model=AIAnalysisOut)
-def ai_analyze(db: Session = Depends(get_db), me: User = Depends(get_current_user)):
+def ai_analyze(db: Session = Depends(get_db), me: User = Depends(require_pro)):
     """Full business analysis: profit, hourly rate, cash flow, missed deductions."""
     data = _gather_user_data(db, me)
 
@@ -670,7 +708,7 @@ Return this exact JSON structure (no markdown, no preamble):
 
 # ─── /ai/forecast ───────────────────────────────────────────────────────────────
 @app.get("/ai/forecast", response_model=AIForecastOut)
-def ai_forecast(db: Session = Depends(get_db), me: User = Depends(get_current_user)):
+def ai_forecast(db: Session = Depends(get_db), me: User = Depends(require_pro)):
     """30 and 90 day income forecast based on current pipeline."""
     data = _gather_user_data(db, me)
 
@@ -729,7 +767,7 @@ class ProposalRequest(BaseModel):
 
 
 @app.post("/ai/proposal", response_model=AIProposalOut)
-def ai_proposal(req: ProposalRequest, db: Session = Depends(get_db), me: User = Depends(get_current_user)):
+def ai_proposal(req: ProposalRequest, db: Session = Depends(get_db), me: User = Depends(require_pro)):
     """Generate a professional job proposal/estimate."""
     data = _gather_user_data(db, me)
 
@@ -781,7 +819,7 @@ class FollowUpRequest(BaseModel):
 
 
 @app.post("/ai/followup", response_model=AIMessageOut)
-def ai_followup(req: FollowUpRequest, db: Session = Depends(get_db), me: User = Depends(get_current_user)):
+def ai_followup(req: FollowUpRequest, db: Session = Depends(get_db), me: User = Depends(require_pro)):
     """Generate a client follow-up message for an unpaid invoice."""
     inv = db.query(Invoice).filter(Invoice.id == req.invoice_id, Invoice.user_id == me.id).first()
     if not inv:
@@ -828,7 +866,7 @@ Return ONLY this JSON:
 
 # ─── /ai/rate-check ─────────────────────────────────────────────────────────────
 @app.get("/ai/rate-check")
-def ai_rate_check(db: Session = Depends(get_db), me: User = Depends(get_current_user)):
+def ai_rate_check(db: Session = Depends(get_db), me: User = Depends(require_pro)):
     """Analyze pricing across jobs and suggest rate adjustments."""
     data = _gather_user_data(db, me)
 
@@ -866,3 +904,160 @@ Return ONLY this JSON:
         return json.loads(text.strip())
     except json.JSONDecodeError:
         raise HTTPException(status_code=500, detail="AI returned malformed response.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SUBSCRIPTION ENDPOINTS
+# iOS app posts RevenueCat customer info here after purchase/restore.
+# RevenueCat also sends server-to-server webhooks to keep status in sync.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SubscriptionUpdateIn(BaseModel):
+    revenuecat_id: str
+    active_entitlements: List[str]  # e.g. ["pro"]
+
+
+@app.get("/subscription/status")
+def subscription_status(me: User = Depends(get_current_user)):
+    """Return the current user's subscription tier."""
+    return {
+        "tier": me.subscription_tier,
+        "is_pro": me.subscription_tier == "pro",
+        "revenuecat_id": me.revenuecat_id,
+    }
+
+
+@app.post("/subscription/update")
+def subscription_update(
+    data: SubscriptionUpdateIn,
+    db: Session = Depends(get_db),
+    me: User = Depends(get_current_user),
+):
+    """Called by the iOS app after a RevenueCat purchase or restore to sync tier."""
+    me.revenuecat_id = data.revenuecat_id
+    me.subscription_tier = "pro" if REVENUECAT_PRO_ENTITLEMENT in data.active_entitlements else "free"
+    db.commit()
+    return {"ok": True, "tier": me.subscription_tier}
+
+
+# RevenueCat event types that mean the subscription is active
+_RC_ACTIVE_EVENTS = {
+    "INITIAL_PURCHASE", "RENEWAL", "PRODUCT_CHANGE",
+    "UNCANCELLATION", "REACTIVATION", "TRANSFER",
+}
+# RevenueCat event types that mean the subscription ended
+_RC_INACTIVE_EVENTS = {"CANCELLATION", "EXPIRATION", "BILLING_ISSUE"}
+
+
+@app.post("/webhooks/revenuecat")
+async def revenuecat_webhook(request: Request, db: Session = Depends(get_db)):
+    """
+    Server-to-server webhook from RevenueCat.
+    In your RevenueCat dashboard → Project Settings → Webhooks, set:
+      URL: https://<your-server>/webhooks/revenuecat
+      Authorization: <your REVENUECAT_WEBHOOK_SECRET>
+    """
+    auth = request.headers.get("Authorization", "")
+    if REVENUECAT_WEBHOOK_SECRET and auth != REVENUECAT_WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid webhook authorization")
+
+    body = await request.json()
+    event = body.get("event", {})
+    event_type = event.get("type", "")
+    app_user_id = event.get("app_user_id", "")
+    entitlement_ids: list = event.get("entitlement_ids") or []
+
+    user = db.query(User).filter(User.revenuecat_id == app_user_id).first()
+    if not user:
+        # Unknown user — nothing to update
+        return {"ok": True}
+
+    if event_type in _RC_ACTIVE_EVENTS:
+        if REVENUECAT_PRO_ENTITLEMENT in entitlement_ids:
+            user.subscription_tier = "pro"
+    elif event_type in _RC_INACTIVE_EVENTS:
+        user.subscription_tier = "free"
+
+    db.commit()
+    return {"ok": True}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MOBILE BACKUP ENDPOINTS
+# Full data export / restore for mobile offline sync and backup.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class MobileBackupOut(BaseModel):
+    version: int
+    exported_at: str
+    user: dict
+    jobs: list
+    invoices: list
+    mileage: list
+    expenses: list
+
+
+class MobileRestoreIn(BaseModel):
+    version: int
+    jobs: Optional[List[dict]] = None
+    invoices: Optional[List[dict]] = None
+    mileage: Optional[List[dict]] = None
+    expenses: Optional[List[dict]] = None
+
+
+@app.get("/mobile/backup", response_model=MobileBackupOut)
+def mobile_backup(db: Session = Depends(get_db), me: User = Depends(get_current_user)):
+    """Export all user data as a portable backup for mobile offline storage."""
+    jobs = db.query(Job).filter(Job.user_id == me.id).all()
+    invoices = db.query(Invoice).filter(Invoice.user_id == me.id).all()
+    mileage_rows = db.query(Mileage).filter(Mileage.user_id == me.id).all()
+    expenses = db.query(Expense).filter(Expense.user_id == me.id).all()
+
+    def _job(j: Job) -> dict:
+        return {
+            "id": j.id, "title": j.title, "client_name": j.client_name,
+            "status": j.status, "start_date": j.start_date, "end_date": j.end_date,
+            "created_at": j.created_at.isoformat() if j.created_at else None,
+        }
+
+    def _invoice(i: Invoice) -> dict:
+        return {
+            "id": i.id, "job_id": i.job_id, "amount": float(i.amount or 0),
+            "note": i.note, "status": i.status,
+            "created_at": i.created_at.isoformat() if i.created_at else None,
+        }
+
+    def _mileage(m: Mileage) -> dict:
+        return {
+            "id": m.id, "job_id": m.job_id, "miles": float(m.miles or 0),
+            "note": m.note,
+            "created_at": m.created_at.isoformat() if m.created_at else None,
+        }
+
+    def _expense(e: Expense) -> dict:
+        return {
+            "id": e.id, "job_id": e.job_id, "amount": float(e.amount or 0),
+            "category": e.category, "note": e.note,
+            "created_at": e.created_at.isoformat() if e.created_at else None,
+        }
+
+    return MobileBackupOut(
+        version=1,
+        exported_at=datetime.utcnow().isoformat() + "Z",
+        user={"id": me.id, "email": me.email, "full_name": me.full_name, "subscription_tier": me.subscription_tier},
+        jobs=[_job(j) for j in jobs],
+        invoices=[_invoice(i) for i in invoices],
+        mileage=[_mileage(m) for m in mileage_rows],
+        expenses=[_expense(e) for e in expenses],
+    )
+
+
+@app.get("/mobile/status")
+def mobile_status():
+    """Health check endpoint for mobile clients to verify connectivity."""
+    return {
+        "ok": True,
+        "service": "JobFlow Mobile API",
+        "version": "1.0",
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+    }
