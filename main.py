@@ -7,6 +7,7 @@ from typing import Optional, List
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.staticfiles import StaticFiles
 from jose import jwt, JWTError
 from passlib.context import CryptContext
 from pydantic import BaseModel, EmailStr, ConfigDict
@@ -29,6 +30,9 @@ def _parse_cors_origins(raw: str) -> list[str]:
 
 
 app = FastAPI(title="JobFlow API")
+
+# Serve static assets (icon, images, etc.)
+app.mount("/assets", StaticFiles(directory="assets"), name="assets")
 
 cors_origins = _parse_cors_origins(_env("CORS_ORIGINS", "*"))
 app.add_middleware(
@@ -866,3 +870,84 @@ Return ONLY this JSON:
         return json.loads(text.strip())
     except json.JSONDecodeError:
         raise HTTPException(status_code=500, detail="AI returned malformed response.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MOBILE BACKUP ENDPOINTS
+# Full data export / restore for mobile offline sync and backup.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class MobileBackupOut(BaseModel):
+    version: int
+    exported_at: str
+    user: dict
+    jobs: list
+    invoices: list
+    mileage: list
+    expenses: list
+
+
+class MobileRestoreIn(BaseModel):
+    version: int
+    jobs: Optional[List[dict]] = None
+    invoices: Optional[List[dict]] = None
+    mileage: Optional[List[dict]] = None
+    expenses: Optional[List[dict]] = None
+
+
+@app.get("/mobile/backup", response_model=MobileBackupOut)
+def mobile_backup(db: Session = Depends(get_db), me: User = Depends(get_current_user)):
+    """Export all user data as a portable backup for mobile offline storage."""
+    jobs = db.query(Job).filter(Job.user_id == me.id).all()
+    invoices = db.query(Invoice).filter(Invoice.user_id == me.id).all()
+    mileage_rows = db.query(Mileage).filter(Mileage.user_id == me.id).all()
+    expenses = db.query(Expense).filter(Expense.user_id == me.id).all()
+
+    def _job(j: Job) -> dict:
+        return {
+            "id": j.id, "title": j.title, "client_name": j.client_name,
+            "status": j.status, "start_date": j.start_date, "end_date": j.end_date,
+            "created_at": j.created_at.isoformat() if j.created_at else None,
+        }
+
+    def _invoice(i: Invoice) -> dict:
+        return {
+            "id": i.id, "job_id": i.job_id, "amount": float(i.amount or 0),
+            "note": i.note, "status": i.status,
+            "created_at": i.created_at.isoformat() if i.created_at else None,
+        }
+
+    def _mileage(m: Mileage) -> dict:
+        return {
+            "id": m.id, "job_id": m.job_id, "miles": float(m.miles or 0),
+            "note": m.note,
+            "created_at": m.created_at.isoformat() if m.created_at else None,
+        }
+
+    def _expense(e: Expense) -> dict:
+        return {
+            "id": e.id, "job_id": e.job_id, "amount": float(e.amount or 0),
+            "category": e.category, "note": e.note,
+            "created_at": e.created_at.isoformat() if e.created_at else None,
+        }
+
+    return MobileBackupOut(
+        version=1,
+        exported_at=datetime.utcnow().isoformat() + "Z",
+        user={"id": me.id, "email": me.email, "full_name": me.full_name},
+        jobs=[_job(j) for j in jobs],
+        invoices=[_invoice(i) for i in invoices],
+        mileage=[_mileage(m) for m in mileage_rows],
+        expenses=[_expense(e) for e in expenses],
+    )
+
+
+@app.get("/mobile/status")
+def mobile_status():
+    """Health check endpoint for mobile clients to verify connectivity."""
+    return {
+        "ok": True,
+        "service": "JobFlow Mobile API",
+        "version": "1.0",
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+    }
